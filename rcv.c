@@ -8,6 +8,13 @@
 
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
+
 #define RECV_WINDOW 4096   // 简易缓冲上限（可调）
 typedef struct {
     int      present;      // 是否已收到
@@ -35,8 +42,21 @@ static inline int slot_index(uint32_t base, uint32_t seq) {
     return (int)d;
 }
 
+static void send_ack(int s, const struct sockaddr *peer, socklen_t plen, uint32_t ack_seq) {
+    hdr_t ack = {0};
+    ack.type = PKT_ACK;
+    ack.seq  = ack_seq;   // 最后一个已按序提交的分片号
+    ack.len  = 0;
+    // ACK 也必须走 sendto_dbg（项目要求）
+    sendto_dbg(s, (const char*)&ack, sizeof(ack), 0, peer, plen);
+}
+
 static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or_wan_unused)
 {
+    struct sockaddr_storage sender_addr;
+    socklen_t sender_len = 0;
+    int sender_known = 0;
+
     int s;
     struct addrinfo hints, *res;
     memset(&hints,0,sizeof(hints));
@@ -94,6 +114,9 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
             bytes_in_order = 0;
             fin_seen = 0;
             printf("START: recv -> %s (size=%lu)\n", dst_name, (unsigned long)file_size);
+            memcpy(&sender_addr, &peer, sizeof(peer));
+            sender_len = plen;
+            sender_known = 1;
         }
         else if (h->type == PKT_DATA) {
             if (!fp) continue; // 未 START，忽略
@@ -120,6 +143,10 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
                 // 窗口整体左移一格（O(W) 简单实现；后续可用环形缓冲优化成 O(1)）
                 memmove(&buf[0], &buf[1], sizeof(slot_t) * (RECV_WINDOW - 1));
                 memset(&buf[RECV_WINDOW - 1], 0, sizeof(slot_t));
+            }
+            // 只要推进了按序进度，就发一次 ACK
+            if (sender_known && next_write_seq > 0) {
+                send_ack(s, (struct sockaddr*)&sender_addr, sender_len, next_write_seq - 1);
             }
 
             // 这里也可以做“每 10MB 输出一次中间速率”的计数（后续再加时间戳/速率计算）
