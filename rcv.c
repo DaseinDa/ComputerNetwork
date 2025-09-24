@@ -22,6 +22,8 @@ typedef struct {
     uint32_t len;          // 该分片长度
     uint8_t  data[MAX_PAYLOAD];
 } slot_t;
+#define TEN_MB (10u * 1024u * 1024u)
+
 static void die(const char* msg) { perror(msg); exit(1); }  // ← 新增
 
 static void Usage(int argc, char *argv[]);
@@ -64,6 +66,8 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags    = AI_PASSIVE;
 
+    
+
     if (getaddrinfo(NULL, port_str, &hints, &res)!=0) die("getaddrinfo");
     s = socket(res->ai_family, res->ai_socktype, 0);
     if (s<0) die("socket");
@@ -80,6 +84,11 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
     uint64_t bytes_in_order = 0;
     int      fin_seen = 0;            // 收到 FIN
     uint32_t fin_seq  = 0;            // 期望的总包数（来自 FIN）
+    //Statistics
+    uint64_t start_ms = 0;        // 本次会话开始时间（收到 START 后）
+    uint64_t last_mark_ms = 0;    // 上一个 10MB 报告时间
+    uint64_t last_mark_bytes = 0; // 上一个 10MB 报告时的有序字节数
+
 
     // 简易滑动窗口缓冲
     slot_t*  buf = (slot_t*)calloc(RECV_WINDOW, sizeof(slot_t));
@@ -101,6 +110,7 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
                 // 忙的话这里应回 BUSY（等你后续做握手/并发控制）
                 continue;
             }
+
             file_size = h->file_size;
             // 取文件名（h->len 为 name 长度）
             size_t name_len = (size_t)h->len;
@@ -109,6 +119,13 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
             dst_name[name_len] = '\0';
 
             fp = fopen(dst_name, "wb");
+
+            //Statistics
+            start_ms = now_ms();
+            last_mark_ms = start_ms;
+            last_mark_bytes = 0;
+
+
             if (!fp) die("fopen");
             next_write_seq = 0;
             bytes_in_order = 0;
@@ -144,6 +161,22 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
                 memmove(&buf[0], &buf[1], sizeof(slot_t) * (RECV_WINDOW - 1));
                 memset(&buf[RECV_WINDOW - 1], 0, sizeof(slot_t));
             }
+
+
+            // 10MB 打点：每当有序累计写入增加了 >=10MB，就打印一次
+            uint64_t delta_bytes = bytes_in_order - last_mark_bytes;
+            if (delta_bytes >= TEN_MB) {
+                uint64_t now = now_ms();
+                uint64_t delta_ms = (now - last_mark_ms) ? (now - last_mark_ms) : 1; // 防除零
+                double recent_mbps = (delta_bytes * 8.0) / (double)delta_ms / 1000.0; // Mb/s
+                printf("[RCV] Progress: %.2f MB total, recent 10MB avg rate: %.2f Mb/s\n",
+                    bytes_in_order / (1024.0*1024.0), recent_mbps);
+                fflush(stdout);
+                last_mark_ms = now;
+                // 如果增量 >10MB（一次推进很多），也只前进一个 10MB 档位
+                last_mark_bytes += TEN_MB;
+            }
+
             // 只要推进了按序进度，就发一次 ACK
             if (sender_known && next_write_seq > 0) {
                 send_ack(s, (struct sockaddr*)&sender_addr, sender_len, next_write_seq - 1);
@@ -154,9 +187,18 @@ static void run_receiver(const char* port_str, int expect_loss_sim_env_is_lan_or
         else if (h->type == PKT_FIN) {
             fin_seen = 1; fin_seq = h->seq; file_size = h->file_size;
             printf("FIN seen: total_seq=%u, size=%lu\n", fin_seq, (unsigned long)file_size);
+            uint64_t end_ms = now_ms();
+
 
             // 如果已经全部按序写完（简单判断：bytes_in_order == file_size）
             if (fp && bytes_in_order == file_size) {
+                //When finished, print statistics result
+                double elapsed_s = (end_ms - start_ms) / 1000.0;
+                double avg_mbps = (bytes_in_order * 8.0) / (elapsed_s * 1e6);
+                printf("[RCV] DONE: %.2f MB in %.2f s, avg goodput: %.2f Mb/s\n",
+                    bytes_in_order / (1024.0*1024.0), elapsed_s, avg_mbps);
+                fflush(stdout);
+                
                 fclose(fp); fp = NULL;
                 printf("RECV DONE: %s (%lu bytes)\n", dst_name, (unsigned long)bytes_in_order);
                 // 简化：单次会话就退出；你也可以 while 等下一次 START

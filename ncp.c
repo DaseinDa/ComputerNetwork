@@ -202,6 +202,8 @@ static void run_sender(const char* src, const char* dst_name,
     if (servinfo->ai_family == AF_INET || servinfo->ai_family == AF_INET6) {
         nfds = s + 1;
     }
+    // >>> 在这里记录发送起始时间 <<<
+    uint64_t snd_start_ms = now_ms();
 
     while (send_base < total_segs) {
         // 1) 尽量填满窗口
@@ -251,6 +253,8 @@ static void run_sender(const char* src, const char* dst_name,
             }
         }
     }
+    //    在这里记录结束时间
+    uint64_t snd_end_ms = now_ms();
     // 窗口内全确认 → 发 FIN
 
 
@@ -289,6 +293,20 @@ static void run_sender(const char* src, const char* dst_name,
 
     sendto_dbg(s, (const char*)&fin, sizeof(fin), 0,
                servinfo->ai_addr, servinfo->ai_addrlen);
+
+    //发完 FIN 后打印统计
+    double snd_elapsed_s = (snd_end_ms - snd_start_ms) / 1000.0;
+    double over_wire_MB  = total_sent_bytes / (1024.0*1024.0);
+    double over_wire_mbps = (total_sent_bytes * 8.0) / (snd_elapsed_s * 1e6);
+
+    // 若你有文件大小 fsz，可计算冗余度（含重传的发送量 / 实际文件大小）
+    double redundancy = (fsz > 0) ? ((double)total_sent_bytes / (double)fsz) : 0.0;
+
+    printf("[SND] SENT(total incl. retrans): %.2f MB in %.2f s, avg send rate: %.2f Mb/s\n",
+        over_wire_MB, snd_elapsed_s, over_wire_mbps);
+    printf("[SND] Redundancy (bytes_sent/file_size): %.2fx\n", redundancy);
+    fflush(stdout);
+
 
     fclose(fp);
     freeaddrinfo(servinfo);
