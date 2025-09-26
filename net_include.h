@@ -19,6 +19,11 @@
 #define PKT_DATA       2
 #define PKT_FIN        3
 #define PKT_ACK        4             // 新增：累积 ACK
+#define PKT_NACK       5
+#define PKT_BUSY       6  // 新增，接收端忙时回复
+#define PKT_START_OK   7 //ready to start transferring
+// e.g. in net_include.h
+
 
 #pragma pack(push,1)
 typedef struct {

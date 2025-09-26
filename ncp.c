@@ -30,9 +30,9 @@ static char *Dst_filename;
 static char *Hostname;
 
 // 窗口与超时参数（可按 LAN/WAN 调整）
-enum { W_LAN = 512, W_WAN = 1500 };
+enum { W_LAN = 512, W_WAN = 2000 };
 static const uint32_t RTO_LAN_MS = 60;
-static const uint32_t RTO_WAN_MS = 300;
+static const uint32_t RTO_WAN_MS = 200;
 
 typedef struct {
     uint32_t len;          // 该分片长度
@@ -205,7 +205,57 @@ static void run_sender(const char* src, const char* dst_name,
     // >>> 在这里记录发送起始时间 <<<
     uint64_t snd_start_ms = now_ms();
 
+    /* ---- Handshake: wait START_OK or BUSY (queue if busy) ---- */
+    int start_ok = 0;
+    uint32_t backoff_ms = 100;            // 初始退避
+    const uint32_t backoff_max = 2000;    // 最大退避 2s
+    uint64_t last_start_tx = 0;
+    /* 新增：记录本次 START 的发送时间，供超时重发用 */
+    last_start_tx = now_ms();
+        
+    for (;;) {
+        // 等待接收端响应（START_OK / BUSY），最多 300ms
+        fd_set hs_rfds; FD_ZERO(&hs_rfds); FD_SET(s, &hs_rfds);
+        struct timeval hs_tv = {.tv_sec=0, .tv_usec=300*1000};
+        int hs_rv = select(s+1, &hs_rfds, NULL, NULL, &hs_tv);
+        if (hs_rv > 0 && FD_ISSET(s, &hs_rfds)) {
+            uint8_t rbuf[sizeof(hdr_t) + 64];
+            struct sockaddr_storage from; socklen_t flen = sizeof(from);
+            ssize_t rcvd = recvfrom(s, rbuf, sizeof(rbuf), 0, (struct sockaddr*)&from, &flen);
+            if (rcvd >= (ssize_t)sizeof(hdr_t)) {
+                hdr_t *rh = (hdr_t*)rbuf;
+                if (rh->type == PKT_START_OK) {    // 接收端就绪
+                    start_ok = 1;
+                    break;
+                } else if (rh->type == PKT_BUSY) { // 排队：指数退避 + 重发 START
+                    // 等 backoff
+                    usleep(backoff_ms * 1000);
+                    // 重发 START（复用你已有的 START 发送逻辑/缓冲）
+                    // 如果你有封装函数，直接调用；否则把你发 START 的两行黏贴到这里
+                    // 例：sendto_dbg(s, (char*)&start_pkt, sizeof(hdr_t)+start_pkt.h.len, 0, servinfo->ai_addr, servinfo->ai_addrlen);
+                    sendto_dbg(s, (char*)&start_pkt, sizeof(hdr_t)+start_pkt.h.len, 0,
+                            servinfo->ai_addr, servinfo->ai_addrlen);
+                    // 指数退避（上限 2s）
+                    backoff_ms = (backoff_ms < backoff_max) ? (backoff_ms * 2) : backoff_max;
+                    last_start_tx = now_ms();
+                    continue; // 继续排队
+                }
+            }
+        } else {
+       // 超时：保活重发 START（不放行，继续排队等待 START_OK）
+               // 超时：保活重发 START（不放行，继续排队等待 START_OK）
+            if (now_ms() - last_start_tx > 500) {
+            sendto_dbg(s, (char*)&start_pkt, sizeof(hdr_t)+start_pkt.h.len, 0,
+                        servinfo->ai_addr, servinfo->ai_addrlen);
+                last_start_tx = now_ms();
+            }
+            continue;
+        }
+    }
+    
     while (send_base < total_segs) {
+ 
+
         // 1) 尽量填满窗口
         while (next_seq < total_segs && next_seq < send_base + W) {
             if (!segs[next_seq].acked) {
@@ -239,7 +289,55 @@ static void run_sender(const char* src, const char* dst_name,
                             segs[i].acked = 1;
                         }
                     }
-                }
+                }else if (rh->type == PKT_NACK) {
+                        uint32_t want = rh->seq;  // 接收端告诉我们缺这个分片
+                        if (want < total_segs && !segs[want].acked) {
+                            // 立即重传这个分片
+                            send_one_segment(s, servinfo->ai_addr, servinfo->ai_addrlen,
+                                            fp, want, segs, &total_sent_bytes);
+                            // 可选：记录一下 NACK 命中次数/日志
+                            // printf("[SND] NACK->rexmit %u\n", want);
+                        }
+                    }else if (rh->type == PKT_BUSY) {
+                        // 接收端忙，说明它正服务别人——我也得排队
+                            // 正在服务别人 → 暂停发送，进入排队：退避 + 重发 START，直到放行
+                        uint32_t backoff_ms2 = 100;
+                        const uint32_t backoff_max2 = 2000;
+                        for (;;) {
+                            usleep(backoff_ms2 * 1000);
+                            // 重发 START（同上）
+                            sendto_dbg(s, (char*)&start_pkt, sizeof(hdr_t)+start_pkt.h.len, 0,
+                                    servinfo->ai_addr, servinfo->ai_addrlen);
+
+                            // 等一小会看看是否仍 BUSY 或已就绪
+                            fd_set q_rfds; FD_ZERO(&q_rfds); FD_SET(s, &q_rfds);
+                            struct timeval q_tv = {.tv_sec=0, .tv_usec=300*1000};
+                            int q_rv = select(s+1, &q_rfds, NULL, NULL, &q_tv);
+                            if (q_rv > 0 && FD_ISSET(s, &q_rfds)) {
+                                uint8_t qbuf[sizeof(hdr_t) + 64];
+                                struct sockaddr_storage qfrom; socklen_t qlen = sizeof(qfrom);
+                                ssize_t qn = recvfrom(s, qbuf, sizeof(qbuf), 0, (struct sockaddr*)&qfrom, &qlen);
+                                if (qn >= (ssize_t)sizeof(hdr_t)) {
+                                    hdr_t *qh = (hdr_t*)qbuf;
+                                    if (qh->type == PKT_START_OK) {
+                                        // 放行，退出排队循环，继续数据阶段
+                                        break;
+                                    } else if (qh->type == PKT_BUSY) {
+                                        // 继续排队（指数退避）
+                                        backoff_ms2 = (backoff_ms2 < backoff_max2) ? (backoff_ms2 * 2) : backoff_max2;
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                // 没有响应：也视为放行（兼容 rcv 不发 START_OK 的情况）
+                                break;
+                            }
+                        }
+
+                            printf("[SND] Receiver is busy, I was blocked.\n");
+                            // 可以选择重试，或者直接退出
+                        }
+
                 // （后续可处理 BUSY/START_OK/NACK 等）
             }
         }
